@@ -19,15 +19,34 @@ import (
 	"github.com/trustpilot/beat-exporter/collector"
 )
 
+type urls []*url.URL
+
+func (i *urls) String() string {
+	return "HTTP API address of beat"
+}
+
+func (i *urls) Set(value string) error {
+	beatURL, err := url.Parse(value)
+
+	if err != nil {
+		log.Fatalf("failed to parse beat.uris, error: %v", err)
+	}
+
+	*i = append(*i, beatURL)
+	return nil
+}
+
 func main() {
 	var (
 		Name          = "beat_exporter"
 		listenAddress = flag.String("web.listen-address", ":9479", "Address to listen on for web interface and telemetry.")
 		metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
-		beatURI       = flag.String("beat.uri", "http://localhost:5066", "HTTP API address of beat.")
+		beatsUrIs     urls
 		beatTimeout   = flag.Duration("beat.timeout", 10*time.Second, "Timeout for trying to get stats from beat.")
 		showVersion   = flag.Bool("version", false, "Show version and exit")
 	)
+	flag.Var(&beatsUrIs, "beat.uris", "HTTP API addresses of beat.")
+
 	flag.Parse()
 
 	if *showVersion {
@@ -43,36 +62,34 @@ func main() {
 		},
 	})
 
-	beatURL, err := url.Parse(*beatURI)
-
-	if err != nil {
-		log.Fatalf("failed to parse beat.uri, error: %v", err)
-	}
-
 	httpClient := &http.Client{
 		Timeout: *beatTimeout,
 	}
 
-	log.Info("Exploring target for beat type")
-
-	var beatInfo *collector.BeatInfo
-
-	for {
-		beatInfo, err = loadBeatType(httpClient, *beatURL)
-		if err != nil {
-			log.Errorf("Could not load beat type, with error: %v, retrying in 5s", err)
-			time.Sleep(5 * time.Second)
-		} else {
-			break
-		}
-	}
-
-	// version metric
 	registry := prometheus.NewRegistry()
 	versionMetric := version.NewCollector(Name)
-	mainCollector := collector.NewMainCollector(httpClient, beatURL, Name, beatInfo)
 	registry.MustRegister(versionMetric)
-	registry.MustRegister(mainCollector)
+
+	for _, beatURL := range beatsUrIs {
+
+		go func(uri *url.URL) {
+
+			log.Info("Exploring target for beat type")
+
+			for {
+				beatInfo, err := loadBeatType(httpClient, *uri)
+
+				if err != nil {
+					log.Errorf("Could not load beat type, with error: %v, retrying in 5s", err)
+					time.Sleep(5 * time.Second)
+				} else {
+					mainCollector := collector.NewMainCollector(httpClient, uri, Name, beatInfo)
+					registry.MustRegister(mainCollector)
+					break
+				}
+			}
+		}(beatURL)
+	}
 
 	http.Handle(*metricsPath, promhttp.HandlerFor(
 		registry,
@@ -86,7 +103,7 @@ func main() {
 
 	log.WithFields(log.Fields{
 		"addr": *listenAddress,
-	}).Infof("Starting exporter with configured type: %s", beatInfo.Beat)
+	}).Infof("Starting exporter...")
 
 	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
 
